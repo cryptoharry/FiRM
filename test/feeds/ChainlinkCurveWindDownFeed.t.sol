@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {ChainlinkCurveWindDownFeed} from "src/feeds/ChainlinkCurveWindDownFeed.sol";
 import {ChainlinkCurveFeed} from "src/feeds/ChainlinkCurveFeed.sol";
 import {CurveLPPessimisticFeed} from "src/feeds/CurveLPPessimisticFeed.sol";
@@ -114,10 +115,36 @@ contract WindDownMockDBR {
     }
 }
 
+contract WindDownMockDola {
+    mapping(address => uint256) public balanceOf;
+    uint256 public transferCalls;
+    bool public observedWindDownStarted;
+    uint8 public failureMode;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function setFailureMode(uint8 mode) external {
+        failureMode = mode;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        if (failureMode == 1) return false;
+        require(failureMode != 2, "DOLA failure");
+        observedWindDownStarted = ChainlinkCurveWindDownFeed(msg.sender).windDownStarted();
+        transferCalls++;
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
 contract ChainlinkCurveWindDownFeedTest is Test {
     WindDownMockBase base;
     WindDownMockPool pool;
     ChainlinkCurveWindDownFeed feed;
+    WindDownMockDola dola;
     uint32 constant DURATION = 1 days;
     uint256 constant MAX_AGE = 1 days + 1 minutes;
 
@@ -126,6 +153,9 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         base = new WindDownMockBase();
         pool = new WindDownMockPool(address(new WindDownMockToken("TOKEN")));
         feed = deploy(0, DURATION, MAX_AGE);
+        WindDownMockDola mockDola = new WindDownMockDola();
+        vm.etch(address(feed.dola()), address(mockDola).code);
+        dola = WindDownMockDola(address(feed.dola()));
     }
 
     function deploy(uint256 k, uint32 duration, uint256 maxAge) internal returns (ChainlinkCurveWindDownFeed) {
@@ -135,6 +165,84 @@ contract ChainlinkCurveWindDownFeedTest is Test {
     function activate() internal {
         pool.set(0, 1.9e18, false);
         feed.startWindDown();
+    }
+
+    function testRewardPaidImmediatelyToActivationCaller() public {
+        address caller = address(123);
+        dola.mint(address(feed), 10e18);
+        pool.set(0, 1.9e18, false);
+        assertTrue(feed.canStartWindDown());
+        assertEq(dola.balanceOf(caller), 0); // readiness reads do not pay
+        uint256 price = feed.previewWindDownStartPrice();
+        vm.recordLogs();
+        vm.prank(caller);
+        feed.startWindDown();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(logs.length, 2);
+        assertEq(logs[1].emitter, address(feed));
+        assertEq(logs[1].topics[0], keccak256("WindDownRewardPaid(address,uint256)"));
+        assertEq(logs[1].topics[1], bytes32(uint256(uint160(caller))));
+        assertEq(abi.decode(logs[1].data, (uint256)), 10e18);
+        assertEq(dola.balanceOf(caller), 10e18);
+        assertEq(dola.balanceOf(address(feed)), 0);
+        assertTrue(dola.observedWindDownStarted()); // state finalized before the transfer
+        assertEq(feed.windDownStartedAt(), block.timestamp);
+        assertEq(feed.latestAnswer(), int256(price)); // no time needs to elapse for payout
+    }
+
+    function testZeroBalanceStillTransfersAndActivates() public {
+        assertEq(dola.balanceOf(address(feed)), 0);
+        activate();
+        assertTrue(feed.windDownStarted());
+        assertEq(dola.transferCalls(), 1);
+        assertEq(dola.balanceOf(address(this)), 0);
+    }
+
+    function testCannotClaimAgainEvenIfFundedAfterActivation() public {
+        dola.mint(address(feed), 10e18);
+        activate();
+        dola.mint(address(feed), 5e18);
+        vm.expectRevert(ChainlinkCurveWindDownFeed.WindDownAlreadyStarted.selector);
+        feed.startWindDown();
+        assertEq(dola.balanceOf(address(this)), 10e18);
+        assertEq(dola.balanceOf(address(feed)), 5e18);
+        assertEq(dola.transferCalls(), 1);
+    }
+
+    function testIneligibleCallerCannotCollectReward() public {
+        dola.mint(address(feed), 10e18);
+        vm.expectRevert(ChainlinkCurveWindDownFeed.TriggerNotReached.selector);
+        feed.startWindDown();
+        assertEq(dola.balanceOf(address(feed)), 10e18);
+        assertEq(dola.transferCalls(), 0);
+        assertFalse(feed.windDownStarted());
+    }
+
+    function testFalseTransferRollsBackActivation() public {
+        dola.mint(address(feed), 10e18);
+        dola.setFailureMode(1);
+        pool.set(0, 1.9e18, false);
+        vm.expectRevert(ChainlinkCurveWindDownFeed.DolaTransferFailed.selector);
+        feed.startWindDown();
+        assertFalse(feed.windDownStarted());
+        assertEq(feed.windDownStartedAt(), 0);
+        assertEq(feed.windDownStartPrice(), 0);
+        assertEq(dola.balanceOf(address(feed)), 10e18);
+        dola.setFailureMode(0);
+        feed.startWindDown();
+        assertTrue(feed.windDownStarted());
+        assertEq(dola.balanceOf(address(this)), 10e18);
+    }
+
+    function testRevertingTransferRollsBackActivation() public {
+        dola.mint(address(feed), 10e18);
+        dola.setFailureMode(2);
+        pool.set(0, 1.9e18, false);
+        vm.expectRevert(bytes("DOLA failure"));
+        feed.startWindDown();
+        assertFalse(feed.windDownStarted());
+        assertEq(feed.windDownStartedAt(), 0);
+        assertEq(dola.balanceOf(address(feed)), 10e18);
     }
 
     function testGenericMetadataAndFixedThreshold() public view {

@@ -12,12 +12,17 @@ import {IERC20} from "src/interfaces/IERC20.sol";
 ///      Before activation: base USD price * 1e18 / Curve EMA.
 ///      After activation: fixed starting USD price decays to 1 raw feed unit; timestamps are zero.
 ///      Activation is permissionless at EMA >= 1.9e18, without a persistence window.
+///      Fund this feed with Ethereum mainnet DOLA before activation to offer a one-time bounty.
+///      The caller receives the full balance in the activation transaction, including a zero transfer.
+///      There is no rescue function; DOLA sent after activation cannot be claimed.
+///      Consuming FiRM markets must enable the borrow controller's staleness check.
 contract ChainlinkCurveWindDownFeed {
     uint256 public constant WAD = 1e18;
     uint256 public constant EMA_CAP = 2e18;
     uint256 public constant WIND_DOWN_TRIGGER_EMA = 1.9e18;
     uint256 public constant TERMINAL_PRICE = 1;
     uint256 public constant targetIndex = 0;
+    IERC20 public constant dola = IERC20(0x865377367054516e17014CcdED1e7d814EDC9ce4);
 
     IChainlinkBasePriceFeed public immutable assetToUsd;
     ICurvePool public immutable curvePool;
@@ -39,10 +44,12 @@ contract ChainlinkCurveWindDownFeed {
     error StaleActivationPrice();
     error TriggerNotReached();
     error WindDownAlreadyStarted();
+    error DolaTransferFailed();
 
     event WindDownStarted(
         address indexed caller, uint256 startedAt, uint256 startPrice, uint256 triggerEma, uint256 duration
     );
+    event WindDownRewardPaid(address indexed caller, uint256 amount);
 
     struct Round {
         uint80 roundId;
@@ -91,7 +98,8 @@ contract ChainlinkCurveWindDownFeed {
         return uint256(round.answer);
     }
 
-    /// @notice Permanently activates decay. Anyone may call; price and time cannot be supplied.
+    /// @notice Permanently activates decay and immediately pays the caller this feed's entire DOLA balance.
+    /// @dev Anyone may call; price and time cannot be supplied. Zero-balance activation is supported.
     /// @dev A rejected borrowing transaction cannot be used to persist activation: its state
     ///      changes would revert too. The keeper should submit this as a separate transaction.
     function startWindDown() external {
@@ -102,6 +110,11 @@ contract ChainlinkCurveWindDownFeed {
         windDownRoundId = round.roundId;
         windDownAnsweredInRound = round.answeredInRound;
         emit WindDownStarted(msg.sender, block.timestamp, uint256(round.answer), ema, windDownDuration);
+
+        // Finalize activation before interacting with DOLA. Its transfer supports zero amounts.
+        uint256 reward = dola.balanceOf(address(this));
+        if (!dola.transfer(msg.sender, reward)) revert DolaTransferFailed();
+        emit WindDownRewardPaid(msg.sender, reward);
     }
 
     function latestRoundData()
