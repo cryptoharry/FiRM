@@ -11,7 +11,7 @@ import {IERC20} from "src/interfaces/IERC20.sol";
 ///      Use ChainlinkCurveFeed for nonzero target indices; their direct EMA has no downside floor.
 ///      Before activation: base USD price * 1e18 / Curve EMA.
 ///      After activation: fixed starting USD price decays to 1 raw feed unit; timestamps are zero.
-///      Activation is permissionless at EMA >= 1.9e18, without a persistence window.
+///      Activation is permissionless at EMA >= 1.9e18, without a persistence window or timestamp check.
 ///      Fund this feed with Ethereum mainnet DOLA before activation to offer a one-time bounty.
 ///      The caller receives the full balance in the activation transaction, including a zero transfer.
 ///      There is no rescue function; DOLA sent after activation cannot be claimed.
@@ -27,7 +27,6 @@ contract ChainlinkCurveWindDownFeed {
     ICurvePool public immutable curvePool;
     uint256 public immutable assetOrTargetK;
     uint32 public immutable windDownDuration;
-    uint256 public immutable activationMaxAge;
     string public description;
 
     bool public windDownStarted;
@@ -39,8 +38,6 @@ contract ChainlinkCurveWindDownFeed {
     error InvalidConfiguration();
     error InvalidBasePrice();
     error InvalidEma();
-    error InvalidTimestamp();
-    error StaleActivationPrice();
     error TriggerNotReached();
     error WindDownAlreadyStarted();
 
@@ -57,14 +54,12 @@ contract ChainlinkCurveWindDownFeed {
     /// @param _curvePool Curve pool with the priced target asset at coin index zero.
     /// @param _k Oracle index: 0 represents coins[1], 1 represents coins[2], etc.
     /// @param _duration Seconds from activation until the terminal price.
-    /// @param _activationMaxAge Maximum age of the base-feed timestamp at activation.
-    constructor(address _assetToUsd, address _curvePool, uint256 _k, uint32 _duration, uint256 _activationMaxAge) {
+    constructor(address _assetToUsd, address _curvePool, uint256 _k, uint32 _duration) {
         assetToUsd = IChainlinkBasePriceFeed(_assetToUsd);
-        if (assetToUsd.decimals() != 18 || _duration == 0 || _activationMaxAge == 0) revert InvalidConfiguration();
+        if (assetToUsd.decimals() != 18 || _duration == 0) revert InvalidConfiguration();
         curvePool = ICurvePool(_curvePool);
         assetOrTargetK = _k;
         windDownDuration = _duration;
-        activationMaxAge = _activationMaxAge;
         // Check that the selected oracle index is populated and infer the target description.
         if (curvePool.coins(_k + 1) == address(0)) revert InvalidConfiguration();
         string memory coin = IERC20(curvePool.coins(targetIndex)).symbol();
@@ -150,11 +145,8 @@ contract ChainlinkCurveWindDownFeed {
         if (windDownStarted) {
             revert WindDownAlreadyStarted();
         }
-        uint256 updatedAt;
-        (roundId, price,, updatedAt, answeredInRound) = latestRoundData();
+        (roundId, price,,, answeredInRound) = latestRoundData();
         ema = curvePool.price_oracle(assetOrTargetK);
         if (ema < WIND_DOWN_TRIGGER_EMA) revert TriggerNotReached();
-        if (updatedAt == 0 || updatedAt > block.timestamp) revert InvalidTimestamp();
-        if (block.timestamp - updatedAt > activationMaxAge) revert StaleActivationPrice();
     }
 }

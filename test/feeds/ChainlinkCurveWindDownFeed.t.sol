@@ -145,20 +145,20 @@ contract ChainlinkCurveWindDownFeedTest is Test {
     ChainlinkCurveWindDownFeed feed;
     WindDownMockDola dola;
     uint32 constant DURATION = 1 days;
-    uint256 constant MAX_AGE = 1 days + 1 minutes;
+    uint256 constant BORROW_STALENESS_THRESHOLD = 1 days + 1 minutes;
 
     function setUp() public {
         vm.warp(10 days);
         base = new WindDownMockBase();
         pool = new WindDownMockPool(address(new WindDownMockToken("TOKEN")));
-        feed = deploy(0, DURATION, MAX_AGE);
+        feed = deploy(0, DURATION);
         WindDownMockDola mockDola = new WindDownMockDola();
         vm.etch(address(feed.dola()), address(mockDola).code);
         dola = WindDownMockDola(address(feed.dola()));
     }
 
-    function deploy(uint256 k, uint32 duration, uint256 maxAge) internal returns (ChainlinkCurveWindDownFeed) {
-        return new ChainlinkCurveWindDownFeed(address(base), address(pool), k, duration, maxAge);
+    function deploy(uint256 k, uint32 duration) internal returns (ChainlinkCurveWindDownFeed) {
+        return new ChainlinkCurveWindDownFeed(address(base), address(pool), k, duration);
     }
 
     function activate() internal {
@@ -250,7 +250,7 @@ contract ChainlinkCurveWindDownFeedTest is Test {
 
     function testNonzeroOracleIndexAndDifferentAsset() public {
         pool = new WindDownMockPool(address(new WindDownMockToken("OTHER")));
-        ChainlinkCurveWindDownFeed other = deploy(1, DURATION, MAX_AGE);
+        ChainlinkCurveWindDownFeed other = deploy(1, DURATION);
         pool.set(0, 2e18, false);
         pool.set(1, 1.5e18, false);
         assertEq(other.description(), "OTHER / USD");
@@ -287,21 +287,21 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         assertFalse(feed.windDownStarted());
     }
 
-    function testTimestampValidationAndBoundary() public {
+    function testActivationIgnoresBaseFeedTimestamp() public {
         pool.set(0, 1.9e18, false);
-        base.set(1e18, 0, false);
-        assertFalse(feed.canStartWindDown());
-        vm.expectRevert(ChainlinkCurveWindDownFeed.InvalidTimestamp.selector);
-        feed.startWindDown();
-        base.set(1e18, block.timestamp + 1, false);
-        assertFalse(feed.canStartWindDown());
-        base.set(1e18, block.timestamp - MAX_AGE - 1, false);
-        assertFalse(feed.canStartWindDown());
-        vm.expectRevert(ChainlinkCurveWindDownFeed.StaleActivationPrice.selector);
-        feed.startWindDown();
-        base.set(1e18, block.timestamp - MAX_AGE, false);
-        assertTrue(feed.canStartWindDown());
-        feed.startWindDown();
+        uint256[3] memory timestamps = [uint256(0), uint256(1), block.timestamp + 1];
+        for (uint256 i; i < timestamps.length; i++) {
+            feed = deploy(0, DURATION);
+            base.set(1e18, timestamps[i], false);
+            assertTrue(feed.canStartWindDown());
+            uint256 price = feed.previewWindDownStartPrice();
+            feed.startWindDown();
+            assertTrue(feed.windDownStarted());
+            assertEq(feed.windDownStartPrice(), price);
+            (,, uint256 startedAt, uint256 updatedAt,) = feed.latestRoundData();
+            assertEq(startedAt, 0);
+            assertEq(updatedAt, 0);
+        }
     }
 
     function testInvalidInputsAndDependencyFailures() public {
@@ -325,19 +325,17 @@ contract ChainlinkCurveWindDownFeedTest is Test {
 
     function testInvalidConstructor() public {
         vm.expectRevert(ChainlinkCurveWindDownFeed.InvalidConfiguration.selector);
-        deploy(0, 0, MAX_AGE);
-        vm.expectRevert(ChainlinkCurveWindDownFeed.InvalidConfiguration.selector);
-        deploy(0, DURATION, 0);
+        deploy(0, 0);
         base.setDecimals(8);
         vm.expectRevert(ChainlinkCurveWindDownFeed.InvalidConfiguration.selector);
-        deploy(0, DURATION, MAX_AGE);
+        deploy(0, DURATION);
         base.setDecimals(18);
         vm.expectRevert();
-        deploy(2, DURATION, MAX_AGE);
+        deploy(2, DURATION);
         vm.expectRevert();
-        new ChainlinkCurveWindDownFeed(address(0), address(pool), 0, DURATION, MAX_AGE);
+        new ChainlinkCurveWindDownFeed(address(0), address(pool), 0, DURATION);
         vm.expectRevert();
-        new ChainlinkCurveWindDownFeed(address(base), address(0), 0, DURATION, MAX_AGE);
+        new ChainlinkCurveWindDownFeed(address(base), address(0), 0, DURATION);
     }
 
     function testInvalidLivePricesRevertAndCannotActivate() public {
@@ -384,7 +382,7 @@ contract ChainlinkCurveWindDownFeedTest is Test {
     function testFuzzDecay(uint32 elapsed, uint96 price, uint32 duration) public {
         price = uint96(bound(price, 2, type(uint96).max));
         duration = uint32(bound(duration, 1, type(uint32).max));
-        feed = deploy(0, duration, MAX_AGE);
+        feed = deploy(0, duration);
         base.set(int256(uint256(price)), block.timestamp, false);
         activate();
         uint256 start = feed.windDownStartPrice();
@@ -400,7 +398,7 @@ contract ChainlinkCurveWindDownFeedTest is Test {
     }
 
     function testEndpointAndMaximumArithmetic() public {
-        feed = deploy(0, type(uint32).max, MAX_AGE);
+        feed = deploy(0, type(uint32).max);
         base.set(type(int256).max / 1e18, block.timestamp, false);
         activate();
         uint256 startTime = block.timestamp;
@@ -423,7 +421,7 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         oracle.setFeed(collateral, OracleFeed(address(yv)), 18);
         WindDownMockMarket market = new WindDownMockMarket(address(oracle), collateral);
         BorrowController controller = new BorrowController(address(this), address(new WindDownMockDBR()));
-        controller.setStalenessThreshold(address(market), MAX_AGE);
+        controller.setStalenessThreshold(address(market), BORROW_STALENESS_THRESHOLD);
         controller.allow(address(this));
         assertFalse(controller.isPriceStale(address(market)));
         vm.prank(address(market));
