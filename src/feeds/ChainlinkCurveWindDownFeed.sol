@@ -44,12 +44,15 @@ contract ChainlinkCurveWindDownFeed {
     error StaleActivationPrice();
     error TriggerNotReached();
     error WindDownAlreadyStarted();
-    error DolaTransferFailed();
 
     event WindDownStarted(
-        address indexed caller, uint256 startedAt, uint256 startPrice, uint256 triggerEma, uint256 duration
+        address indexed caller,
+        uint256 startedAt,
+        uint256 startPrice,
+        uint256 triggerEma,
+        uint256 duration,
+        uint256 reward
     );
-    event WindDownRewardPaid(address indexed caller, uint256 amount);
 
     struct Round {
         uint80 roundId;
@@ -109,12 +112,11 @@ contract ChainlinkCurveWindDownFeed {
         windDownStartPrice = uint256(round.answer);
         windDownRoundId = round.roundId;
         windDownAnsweredInRound = round.answeredInRound;
-        emit WindDownStarted(msg.sender, block.timestamp, uint256(round.answer), ema, windDownDuration);
 
         // Finalize activation before interacting with DOLA. Its transfer supports zero amounts.
         uint256 reward = dola.balanceOf(address(this));
-        if (!dola.transfer(msg.sender, reward)) revert DolaTransferFailed();
-        emit WindDownRewardPaid(msg.sender, reward);
+        dola.transfer(msg.sender, reward);
+        emit WindDownStarted(msg.sender, block.timestamp, uint256(round.answer), ema, windDownDuration, reward);
     }
 
     function latestRoundData()

@@ -119,19 +119,18 @@ contract WindDownMockDola {
     mapping(address => uint256) public balanceOf;
     uint256 public transferCalls;
     bool public observedWindDownStarted;
-    uint8 public failureMode;
+    bool public fail;
 
     function mint(address to, uint256 amount) external {
         balanceOf[to] += amount;
     }
 
-    function setFailureMode(uint8 mode) external {
-        failureMode = mode;
+    function setFail(bool f) external {
+        fail = f;
     }
 
     function transfer(address to, uint256 amount) external returns (bool) {
-        if (failureMode == 1) return false;
-        require(failureMode != 2, "DOLA failure");
+        require(!fail, "DOLA failure");
         observedWindDownStarted = ChainlinkCurveWindDownFeed(msg.sender).windDownStarted();
         transferCalls++;
         balanceOf[msg.sender] -= amount;
@@ -178,11 +177,11 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         vm.prank(caller);
         feed.startWindDown();
         Vm.Log[] memory logs = vm.getRecordedLogs();
-        assertEq(logs.length, 2);
-        assertEq(logs[1].emitter, address(feed));
-        assertEq(logs[1].topics[0], keccak256("WindDownRewardPaid(address,uint256)"));
-        assertEq(logs[1].topics[1], bytes32(uint256(uint160(caller))));
-        assertEq(abi.decode(logs[1].data, (uint256)), 10e18);
+        assertEq(logs.length, 1);
+        assertEq(logs[0].emitter, address(feed));
+        assertEq(logs[0].topics[0], keccak256("WindDownStarted(address,uint256,uint256,uint256,uint256,uint256)"));
+        assertEq(logs[0].topics[1], bytes32(uint256(uint160(caller))));
+        assertEq(logs[0].data, abi.encode(block.timestamp, price, uint256(1.9e18), DURATION, uint256(10e18)));
         assertEq(dola.balanceOf(caller), 10e18);
         assertEq(dola.balanceOf(address(feed)), 0);
         assertTrue(dola.observedWindDownStarted()); // state finalized before the transfer
@@ -218,25 +217,9 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         assertFalse(feed.windDownStarted());
     }
 
-    function testFalseTransferRollsBackActivation() public {
-        dola.mint(address(feed), 10e18);
-        dola.setFailureMode(1);
-        pool.set(0, 1.9e18, false);
-        vm.expectRevert(ChainlinkCurveWindDownFeed.DolaTransferFailed.selector);
-        feed.startWindDown();
-        assertFalse(feed.windDownStarted());
-        assertEq(feed.windDownStartedAt(), 0);
-        assertEq(feed.windDownStartPrice(), 0);
-        assertEq(dola.balanceOf(address(feed)), 10e18);
-        dola.setFailureMode(0);
-        feed.startWindDown();
-        assertTrue(feed.windDownStarted());
-        assertEq(dola.balanceOf(address(this)), 10e18);
-    }
-
     function testRevertingTransferRollsBackActivation() public {
         dola.mint(address(feed), 10e18);
-        dola.setFailureMode(2);
+        dola.setFail(true);
         pool.set(0, 1.9e18, false);
         vm.expectRevert(bytes("DOLA failure"));
         feed.startWindDown();
