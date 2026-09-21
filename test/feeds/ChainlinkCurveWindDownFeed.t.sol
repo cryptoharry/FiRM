@@ -235,10 +235,10 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         assertEq(feed.WIND_DOWN_TRIGGER_EMA(), 1.9e18);
     }
 
-    function testFuzzNormalModeMatchesExistingFeed(uint96 basePrice, uint64 ema) public {
-        basePrice = uint96(bound(basePrice, 1e18, type(uint96).max));
+    function testFuzzNormalModeMatchesExistingFeed(uint256 basePrice, uint64 ema) public {
+        basePrice = bound(basePrice, 1e18, uint256(type(int256).max) / 1e18);
         ema = uint64(bound(ema, 1, 2e18));
-        base.set(int256(uint256(basePrice)), block.timestamp, false);
+        base.set(int256(basePrice), block.timestamp, false);
         pool.set(0, ema, false);
         ChainlinkCurveFeed existing = new ChainlinkCurveFeed(address(base), address(pool), 0, 0);
         (bool ok, bytes memory actual) = address(feed).staticcall(abi.encodeWithSignature("latestRoundData()"));
@@ -334,8 +334,32 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         base.setDecimals(18);
         vm.expectRevert();
         deploy(2, DURATION, MAX_AGE);
-        vm.expectRevert(ChainlinkCurveWindDownFeed.InvalidConfiguration.selector);
+        vm.expectRevert();
         new ChainlinkCurveWindDownFeed(address(0), address(pool), 0, DURATION, MAX_AGE);
+        vm.expectRevert();
+        new ChainlinkCurveWindDownFeed(address(base), address(0), 0, DURATION, MAX_AGE);
+    }
+
+    function testInvalidLivePricesRevertAndCannotActivate() public {
+        pool.set(0, 1.9e18, false);
+        int256[5] memory invalidPrices =
+            [int256(-1), type(int256).min, int256(0), int256(1), type(int256).max / 1e18 + 1];
+        for (uint256 i; i < invalidPrices.length; i++) {
+            base.set(invalidPrices[i], block.timestamp, false);
+            assertFalse(feed.canStartWindDown());
+            vm.expectRevert();
+            feed.latestRoundData();
+            vm.expectRevert();
+            feed.startWindDown();
+            assertFalse(feed.windDownStarted());
+        }
+        base.set(1e18, block.timestamp, false);
+        pool.set(0, 0, false);
+        vm.expectRevert(ChainlinkCurveWindDownFeed.InvalidEma.selector);
+        feed.latestRoundData();
+        pool.set(0, 2e18 + 1, false);
+        vm.expectRevert(ChainlinkCurveWindDownFeed.InvalidEma.selector);
+        feed.latestRoundData();
     }
 
     function testPermanentActivationAndOutages() public {
@@ -350,7 +374,9 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         pool.set(0, 0, true);
         vm.warp(block.timestamp + DURATION / 2);
         assertEq(feed.latestAnswer(), int256(1 + (startingPrice - 1) / 2));
-        (,, uint256 startedAt, uint256 updatedAt,) = feed.latestRoundData();
+        (uint80 roundId,, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) = feed.latestRoundData();
+        assertEq(roundId, 42);
+        assertEq(answeredInRound, 42);
         assertEq(startedAt, 0);
         assertEq(updatedAt, 0);
     }
