@@ -17,7 +17,6 @@ import {IERC20} from "src/interfaces/IERC20.sol";
 ///      There is no rescue function; DOLA sent after activation cannot be claimed.
 ///      Consuming FiRM markets must enable the borrow controller's staleness check.
 contract ChainlinkCurveWindDownFeed {
-    uint256 public constant EMA_CAP = 2e18;
     uint256 public constant WIND_DOWN_TRIGGER_EMA = 1.9e18;
     uint256 public constant TERMINAL_PRICE = 1;
     uint256 public constant targetIndex = 0;
@@ -29,15 +28,12 @@ contract ChainlinkCurveWindDownFeed {
     uint32 public immutable windDownDuration;
     string public description;
 
-    bool public windDownStarted;
     uint256 public windDownStartedAt;
+    // Zero before activation; the recorded positive price permanently marks activation.
     uint256 public windDownStartPrice;
-    uint80 public windDownRoundId;
-    uint80 public windDownAnsweredInRound;
 
     error InvalidConfiguration();
     error InvalidBasePrice();
-    error InvalidEma();
     error TriggerNotReached();
     error WindDownAlreadyStarted();
 
@@ -66,21 +62,10 @@ contract ChainlinkCurveWindDownFeed {
         description = string(abi.encodePacked(coin, " / USD"));
     }
 
-    /// @notice Keeper readiness check. Returns false for dependency failures or invalid data.
-    /// @dev A successful check does not guarantee a later transaction will succeed.
+    /// @notice Whether the EMA permits activation and wind-down has not already started.
+    /// @dev Only checks the trigger. Execution still needs a readable positive USD price and DOLA transfer.
     function canStartWindDown() external view returns (bool) {
-        try this.previewWindDownStartPrice() returns (uint256) {
-            return true;
-        } catch {
-            return false;
-        }
-    }
-
-    /// @notice Returns the starting USD price if activation is currently permitted; otherwise reverts.
-    /// @dev Shares the exact eligibility checks used by startWindDown(). Does not record state.
-    function previewWindDownStartPrice() external view returns (uint256) {
-        (, int256 price,,) = _activationData();
-        return uint256(price);
+        return windDownStartPrice == 0 && curvePool.price_oracle(assetOrTargetK) >= WIND_DOWN_TRIGGER_EMA;
     }
 
     /// @notice Permanently activates decay and immediately pays the caller this feed's entire DOLA balance.
@@ -88,12 +73,12 @@ contract ChainlinkCurveWindDownFeed {
     /// @dev A rejected borrowing transaction cannot be used to persist activation: its state
     ///      changes would revert too. The keeper should submit this as a separate transaction.
     function startWindDown() external {
-        (uint80 roundId, int256 price, uint80 answeredInRound, uint256 ema) = _activationData();
-        windDownStarted = true;
+        if (windDownStartPrice != 0) revert WindDownAlreadyStarted();
+        uint256 ema = curvePool.price_oracle(assetOrTargetK);
+        if (ema < WIND_DOWN_TRIGGER_EMA) revert TriggerNotReached();
+        (, int256 price,,,) = latestRoundData();
         windDownStartedAt = block.timestamp;
         windDownStartPrice = uint256(price);
-        windDownRoundId = roundId;
-        windDownAnsweredInRound = answeredInRound;
 
         // Finalize activation before interacting with DOLA. Its transfer supports zero amounts.
         uint256 reward = dola.balanceOf(address(this));
@@ -106,7 +91,7 @@ contract ChainlinkCurveWindDownFeed {
         view
         returns (uint80 roundId, int256 usdPrice, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound)
     {
-        if (windDownStarted) {
+        if (windDownStartPrice != 0) {
             // Zero timestamps intentionally signal unusable-for-borrowing data to FiRM.
             // No upstream calls: outages and apparent recoveries cannot interrupt decay.
             uint256 elapsed = block.timestamp - windDownStartedAt;
@@ -116,14 +101,12 @@ contract ChainlinkCurveWindDownFeed {
                 // the remaining duration is at most uint32.max.
                 price += (windDownStartPrice - TERMINAL_PRICE) * (windDownDuration - elapsed) / windDownDuration;
             }
-            return (windDownRoundId, int256(price), 0, 0, windDownAnsweredInRound);
+            return (0, int256(price), 0, 0, 0);
         }
         int256 assetToUsdPrice;
         (roundId, assetToUsdPrice, startedAt, updatedAt, answeredInRound) = assetToUsd.latestRoundData();
-        uint256 ema = curvePool.price_oracle(assetOrTargetK);
-        if (ema == 0 || ema > EMA_CAP) revert InvalidEma();
         // Same coin-0 calculation as ChainlinkCurveFeed; Solidity checks signed overflow.
-        usdPrice = (assetToUsdPrice * int256(10 ** decimals())) / int256(ema);
+        usdPrice = (assetToUsdPrice * int256(10 ** decimals())) / int256(curvePool.price_oracle(assetOrTargetK));
         if (usdPrice <= 0) revert InvalidBasePrice();
         return (roundId, usdPrice, startedAt, updatedAt, answeredInRound);
     }
@@ -135,18 +118,5 @@ contract ChainlinkCurveWindDownFeed {
 
     function decimals() public pure returns (uint256) {
         return 18;
-    }
-
-    function _activationData()
-        internal
-        view
-        returns (uint80 roundId, int256 price, uint80 answeredInRound, uint256 ema)
-    {
-        if (windDownStarted) {
-            revert WindDownAlreadyStarted();
-        }
-        (roundId, price,,, answeredInRound) = latestRoundData();
-        ema = curvePool.price_oracle(assetOrTargetK);
-        if (ema < WIND_DOWN_TRIGGER_EMA) revert TriggerNotReached();
     }
 }

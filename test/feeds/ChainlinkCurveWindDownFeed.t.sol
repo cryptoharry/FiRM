@@ -131,7 +131,7 @@ contract WindDownMockDola {
 
     function transfer(address to, uint256 amount) external returns (bool) {
         require(!fail, "DOLA failure");
-        observedWindDownStarted = ChainlinkCurveWindDownFeed(msg.sender).windDownStarted();
+        observedWindDownStarted = (ChainlinkCurveWindDownFeed(msg.sender).windDownStartPrice() != 0);
         transferCalls++;
         balanceOf[msg.sender] -= amount;
         balanceOf[to] += amount;
@@ -172,7 +172,7 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         pool.set(0, 1.9e18, false);
         assertTrue(feed.canStartWindDown());
         assertEq(dola.balanceOf(caller), 0); // readiness reads do not pay
-        uint256 price = feed.previewWindDownStartPrice();
+        uint256 price = uint256(feed.latestAnswer());
         vm.recordLogs();
         vm.prank(caller);
         feed.startWindDown();
@@ -192,7 +192,7 @@ contract ChainlinkCurveWindDownFeedTest is Test {
     function testZeroBalanceStillTransfersAndActivates() public {
         assertEq(dola.balanceOf(address(feed)), 0);
         activate();
-        assertTrue(feed.windDownStarted());
+        assertGt(feed.windDownStartPrice(), 0);
         assertEq(dola.transferCalls(), 1);
         assertEq(dola.balanceOf(address(this)), 0);
     }
@@ -214,7 +214,7 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         feed.startWindDown();
         assertEq(dola.balanceOf(address(feed)), 10e18);
         assertEq(dola.transferCalls(), 0);
-        assertFalse(feed.windDownStarted());
+        assertEq(feed.windDownStartPrice(), 0);
     }
 
     function testRevertingTransferRollsBackActivation() public {
@@ -223,7 +223,7 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         pool.set(0, 1.9e18, false);
         vm.expectRevert(bytes("DOLA failure"));
         feed.startWindDown();
-        assertFalse(feed.windDownStarted());
+        assertEq(feed.windDownStartPrice(), 0);
         assertEq(feed.windDownStartedAt(), 0);
         assertEq(dola.balanceOf(address(feed)), 10e18);
     }
@@ -260,7 +260,7 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         pool.set(1, 1.9e18, false);
         assertTrue(other.canStartWindDown());
         other.startWindDown();
-        assertTrue(other.windDownStarted());
+        assertGt(other.windDownStartPrice(), 0);
     }
 
     function testThresholdBoundaryAndPermissionlessActivation() public {
@@ -270,8 +270,8 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         feed.startWindDown();
         pool.set(0, 1.9e18, false);
         assertTrue(feed.canStartWindDown());
-        uint256 preview = feed.previewWindDownStartPrice();
-        assertFalse(feed.windDownStarted()); // reading cannot activate
+        uint256 preview = uint256(feed.latestAnswer());
+        assertEq(feed.windDownStartPrice(), 0); // reading cannot activate
         vm.prank(address(123));
         feed.startWindDown();
         assertEq(feed.windDownStartPrice(), preview);
@@ -284,7 +284,7 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         pool.set(0, 1.8e18, false);
         vm.expectRevert(ChainlinkCurveWindDownFeed.TriggerNotReached.selector);
         feed.startWindDown();
-        assertFalse(feed.windDownStarted());
+        assertEq(feed.windDownStartPrice(), 0);
     }
 
     function testActivationIgnoresBaseFeedTimestamp() public {
@@ -294,9 +294,9 @@ contract ChainlinkCurveWindDownFeedTest is Test {
             feed = deploy(0, DURATION);
             base.set(1e18, timestamps[i], false);
             assertTrue(feed.canStartWindDown());
-            uint256 price = feed.previewWindDownStartPrice();
+            uint256 price = uint256(feed.latestAnswer());
             feed.startWindDown();
-            assertTrue(feed.windDownStarted());
+            assertGt(feed.windDownStartPrice(), 0);
             assertEq(feed.windDownStartPrice(), price);
             (,, uint256 startedAt, uint256 updatedAt,) = feed.latestRoundData();
             assertEq(startedAt, 0);
@@ -304,23 +304,44 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         }
     }
 
-    function testInvalidInputsAndDependencyFailures() public {
+    function testEligibilityDoesNotReadBaseFeedAndPoolFailuresRevert() public {
         pool.set(0, 1.9e18, false);
-        base.set(0, block.timestamp, false);
-        assertFalse(feed.canStartWindDown());
-        base.set(-1, block.timestamp, false);
-        assertFalse(feed.canStartWindDown());
-        base.set(type(int256).max, block.timestamp, false);
-        assertFalse(feed.canStartWindDown());
         base.set(1e18, block.timestamp, true);
-        assertFalse(feed.canStartWindDown());
+        assertTrue(feed.canStartWindDown());
+        vm.expectRevert(bytes("base failure"));
+        feed.startWindDown();
+        assertEq(feed.windDownStartPrice(), 0);
         base.set(1e18, block.timestamp, false);
         pool.set(0, 0, false);
         assertFalse(feed.canStartWindDown());
-        pool.set(0, 2e18 + 1, false);
-        assertFalse(feed.canStartWindDown());
         pool.set(0, 1.9e18, true);
+        vm.expectRevert(bytes("pool failure"));
+        feed.canStartWindDown();
+        vm.expectRevert(bytes("pool failure"));
+        feed.startWindDown();
+        assertEq(feed.windDownStartPrice(), 0);
+    }
+
+    function testActivationHasNoAdditionalEmaCeiling() public {
+        pool.set(0, 3e18, false);
+        assertTrue(feed.canStartWindDown());
+        assertEq(feed.latestAnswer(), int256(uint256(1e36) / 3e18));
+        feed.startWindDown();
+        assertEq(feed.windDownStartPrice(), uint256(1e36) / 3e18);
         assertFalse(feed.canStartWindDown());
+    }
+
+    function testMinimumStartingPriceLatchesAtTimestampZero() public {
+        vm.warp(0);
+        base.set(2, 0, false);
+        activate();
+        assertEq(feed.windDownStartedAt(), 0);
+        assertEq(feed.windDownStartPrice(), 1);
+        assertFalse(feed.canStartWindDown());
+        vm.expectRevert(ChainlinkCurveWindDownFeed.WindDownAlreadyStarted.selector);
+        feed.startWindDown();
+        vm.warp(DURATION);
+        assertEq(feed.latestAnswer(), 1);
     }
 
     function testInvalidConstructor() public {
@@ -344,19 +365,16 @@ contract ChainlinkCurveWindDownFeedTest is Test {
             [int256(-1), type(int256).min, int256(0), int256(1), type(int256).max / 1e18 + 1];
         for (uint256 i; i < invalidPrices.length; i++) {
             base.set(invalidPrices[i], block.timestamp, false);
-            assertFalse(feed.canStartWindDown());
+            assertTrue(feed.canStartWindDown()); // trigger eligibility does not validate the USD price
             vm.expectRevert();
             feed.latestRoundData();
             vm.expectRevert();
             feed.startWindDown();
-            assertFalse(feed.windDownStarted());
+            assertEq(feed.windDownStartPrice(), 0);
         }
         base.set(1e18, block.timestamp, false);
         pool.set(0, 0, false);
-        vm.expectRevert(ChainlinkCurveWindDownFeed.InvalidEma.selector);
-        feed.latestRoundData();
-        pool.set(0, 2e18 + 1, false);
-        vm.expectRevert(ChainlinkCurveWindDownFeed.InvalidEma.selector);
+        vm.expectRevert(); // division by zero is checked by Solidity
         feed.latestRoundData();
     }
 
@@ -370,11 +388,12 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         assertEq(feed.latestAnswer(), int256(startingPrice));
         base.set(0, 0, true);
         pool.set(0, 0, true);
+        assertFalse(feed.canStartWindDown()); // the permanent latch skips the failed pool call
         vm.warp(block.timestamp + DURATION / 2);
         assertEq(feed.latestAnswer(), int256(1 + (startingPrice - 1) / 2));
         (uint80 roundId,, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) = feed.latestRoundData();
-        assertEq(roundId, 42);
-        assertEq(answeredInRound, 42);
+        assertEq(roundId, 0);
+        assertEq(answeredInRound, 0);
         assertEq(startedAt, 0);
         assertEq(updatedAt, 0);
     }
@@ -442,3 +461,4 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         assertFalse(controller.isPriceStale(address(market))); // deployment prerequisite
     }
 }
+
