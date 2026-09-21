@@ -145,6 +145,7 @@ contract ChainlinkCurveWindDownFeedTest is Test {
     ChainlinkCurveWindDownFeed feed;
     WindDownMockDola dola;
     uint32 constant DURATION = 1 days;
+    address constant RWG = address(0xBEEF);
     uint256 constant BORROW_STALENESS_THRESHOLD = 1 days + 1 minutes;
 
     function setUp() public {
@@ -158,7 +159,7 @@ contract ChainlinkCurveWindDownFeedTest is Test {
     }
 
     function deploy(uint256 k, uint32 duration) internal returns (ChainlinkCurveWindDownFeed) {
-        return new ChainlinkCurveWindDownFeed(address(base), address(pool), k, duration);
+        return new ChainlinkCurveWindDownFeed(address(base), address(pool), k, duration, RWG);
     }
 
     function activate() internal {
@@ -233,6 +234,7 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         assertEq(feed.targetIndex(), 0);
         assertEq(feed.decimals(), 18);
         assertEq(feed.WIND_DOWN_TRIGGER_EMA(), 1.9e18);
+        assertEq(feed.rwg(), RWG);
     }
 
     function testFuzzNormalModeMatchesExistingFeed(uint256 basePrice, uint64 ema) public {
@@ -354,9 +356,11 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         vm.expectRevert();
         deploy(2, DURATION);
         vm.expectRevert();
-        new ChainlinkCurveWindDownFeed(address(0), address(pool), 0, DURATION);
+        new ChainlinkCurveWindDownFeed(address(0), address(pool), 0, DURATION, RWG);
         vm.expectRevert();
-        new ChainlinkCurveWindDownFeed(address(base), address(0), 0, DURATION);
+        new ChainlinkCurveWindDownFeed(address(base), address(0), 0, DURATION, RWG);
+        vm.expectRevert(ChainlinkCurveWindDownFeed.InvalidConfiguration.selector);
+        new ChainlinkCurveWindDownFeed(address(base), address(pool), 0, DURATION, address(0));
     }
 
     function testInvalidLivePricesRevertAndCannotActivate() public {
@@ -378,7 +382,7 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         feed.latestRoundData();
     }
 
-    function testPermanentActivationAndOutages() public {
+    function testRecoveryAndOutagesDoNotAutomaticallyStopDecay() public {
         activate();
         assertFalse(feed.canStartWindDown());
         vm.expectRevert(ChainlinkCurveWindDownFeed.WindDownAlreadyStarted.selector);
@@ -388,7 +392,7 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         assertEq(feed.latestAnswer(), int256(startingPrice));
         base.set(0, 0, true);
         pool.set(0, 0, true);
-        assertFalse(feed.canStartWindDown()); // the permanent latch skips the failed pool call
+        assertFalse(feed.canStartWindDown()); // the active latch skips the failed pool call
         vm.warp(block.timestamp + DURATION / 2);
         assertEq(feed.latestAnswer(), int256(1 + (startingPrice - 1) / 2));
         (uint80 roundId,, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) = feed.latestRoundData();
@@ -396,6 +400,140 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         assertEq(answeredInRound, 0);
         assertEq(startedAt, 0);
         assertEq(updatedAt, 0);
+    }
+
+    function testOnlyRWGCanStopWindDown() public {
+        vm.expectRevert(ChainlinkCurveWindDownFeed.OnlyRWG.selector);
+        feed.stopWindDown();
+        activate();
+        uint256 price = feed.windDownStartPrice();
+        uint256 startedAt = feed.windDownStartedAt();
+        vm.expectRevert(ChainlinkCurveWindDownFeed.OnlyRWG.selector);
+        feed.stopWindDown();
+        assertEq(feed.windDownStartPrice(), price);
+        assertEq(feed.windDownStartedAt(), startedAt);
+    }
+
+    function testStopRestoresLivePriceAndTimestampsAndEmitsEvent() public {
+        activate();
+        vm.warp(block.timestamp + DURATION / 2);
+        base.set(1.03e18, block.timestamp, false);
+        pool.set(0, 1.2e18, false);
+        vm.recordLogs();
+        vm.prank(RWG);
+        feed.stopWindDown();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(logs.length, 1);
+        assertEq(logs[0].emitter, address(feed));
+        assertEq(logs[0].topics[0], keccak256("WindDownStopped(address)"));
+        assertEq(logs[0].topics[1], bytes32(uint256(uint160(RWG))));
+        assertEq(feed.windDownStartPrice(), 0);
+        assertEq(feed.windDownStartedAt(), 0);
+        assertFalse(feed.canStartWindDown());
+        ChainlinkCurveFeed existing = new ChainlinkCurveFeed(address(base), address(pool), 0, 0);
+        (bool ok, bytes memory actual) = address(feed).staticcall(abi.encodeWithSignature("latestRoundData()"));
+        (bool oldOk, bytes memory expected) = address(existing).staticcall(abi.encodeWithSignature("latestRoundData()"));
+        assertTrue(ok && oldOk);
+        assertEq(actual, expected);
+        assertEq(feed.latestAnswer(), existing.latestAnswer());
+    }
+
+    function testStopPreservesStaleUpstreamTimestamp() public {
+        activate();
+        pool.set(0, 1e18, false);
+        base.set(1e18, 0, false);
+        vm.prank(RWG);
+        feed.stopWindDown();
+        (, int256 price,, uint256 updatedAt,) = feed.latestRoundData();
+        assertEq(price, 1e18);
+        assertEq(updatedAt, 0); // reset does not make stale live data fresh
+    }
+
+    function testStopDoesNotCallDependencies() public {
+        activate();
+        base.set(0, 0, true);
+        pool.set(0, 0, true);
+        dola.setFail(true);
+        vm.prank(RWG);
+        feed.stopWindDown();
+        assertEq(feed.windDownStartPrice(), 0);
+        assertEq(feed.windDownStartedAt(), 0);
+        assertEq(dola.transferCalls(), 1);
+        vm.expectRevert(bytes("base failure"));
+        feed.latestRoundData(); // live mode is restored, including dependency failures
+    }
+
+    function testStopAllowsFreshActivationAndPaysOnlyNewReward() public {
+        address firstCaller = address(123);
+        address nextCaller = address(456);
+        dola.mint(address(feed), 10e18);
+        pool.set(0, 1.9e18, false);
+        vm.prank(firstCaller);
+        feed.startWindDown();
+        uint256 firstPrice = feed.windDownStartPrice();
+        vm.warp(block.timestamp + DURATION / 2);
+        dola.mint(address(feed), 5e18);
+        vm.prank(RWG);
+        feed.stopWindDown();
+        assertEq(dola.balanceOf(firstCaller), 10e18);
+        assertEq(dola.balanceOf(RWG), 0);
+        assertEq(dola.balanceOf(address(feed)), 5e18);
+        assertTrue(feed.canStartWindDown()); // no pause or extra recovery threshold
+        base.set(0.9e18, block.timestamp, false);
+        uint256 nextPrice = uint256(feed.latestAnswer());
+        vm.prank(nextCaller);
+        feed.startWindDown();
+        assertEq(feed.windDownStartedAt(), block.timestamp);
+        assertEq(feed.windDownStartPrice(), nextPrice);
+        assertLt(nextPrice, firstPrice);
+        assertEq(feed.latestAnswer(), int256(nextPrice));
+        assertEq(dola.balanceOf(firstCaller), 10e18);
+        assertEq(dola.balanceOf(nextCaller), 5e18);
+        assertEq(dola.balanceOf(address(feed)), 0);
+        assertEq(dola.transferCalls(), 2);
+        assertFalse(feed.canStartWindDown());
+        vm.warp(block.timestamp + DURATION / 2);
+        assertEq(feed.latestAnswer(), int256(1 + (nextPrice - 1) / 2));
+    }
+
+    function testStopIsIdempotentAndAvailableAtTerminalPrice() public {
+        vm.prank(RWG);
+        feed.stopWindDown();
+        activate();
+        vm.warp(block.timestamp + DURATION);
+        assertEq(feed.latestAnswer(), 1);
+        vm.prank(RWG);
+        feed.stopWindDown();
+        assertEq(feed.windDownStartPrice(), 0);
+        assertGt(feed.latestAnswer(), 1);
+        vm.prank(RWG);
+        feed.stopWindDown();
+        assertEq(feed.windDownStartedAt(), 0);
+        assertEq(dola.transferCalls(), 1);
+    }
+
+    function testStopDoesNotClearOracleDailyLows() public {
+        Oracle oracle = new Oracle(address(this));
+        address collateral = address(0xCA11);
+        oracle.setFeed(collateral, OracleFeed(address(feed)), 18);
+        activate();
+        vm.warp(block.timestamp + DURATION / 2);
+        uint256 recordedLow = oracle.getPrice(collateral, 0);
+        uint256 day = block.timestamp / 1 days;
+        assertEq(oracle.dailyLows(collateral, day), recordedLow);
+        pool.set(0, 1e18, false);
+        base.set(1e18, block.timestamp, false);
+        vm.prank(RWG);
+        feed.stopWindDown();
+        assertEq(oracle.getFeedPrice(collateral), 1e18);
+        uint256 dampenedPrice = recordedLow * 10000 / 8500;
+        assertEq(oracle.viewPrice(collateral, 8500), dampenedPrice);
+        assertLt(dampenedPrice, 1e18);
+        assertEq(oracle.dailyLows(collateral, day), recordedLow);
+        vm.warp((day + 1) * 1 days);
+        assertEq(oracle.viewPrice(collateral, 8500), dampenedPrice);
+        vm.warp((day + 2) * 1 days);
+        assertEq(oracle.viewPrice(collateral, 8500), 1e18);
     }
 
     function testFuzzDecay(uint32 elapsed, uint96 price, uint32 duration) public {
@@ -459,6 +597,17 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         assertGt(oracle.viewPrice(collateral, 8500), 0); // liquidation pricing remains available
         controller.setStalenessThreshold(address(market), 0);
         assertFalse(controller.isPriceStale(address(market))); // deployment prerequisite
+        controller.setStalenessThreshold(address(market), BORROW_STALENESS_THRESHOLD);
+        pool.set(0, 1e18, false);
+        otherCoin.set(1e18, block.timestamp, false);
+        vm.prank(RWG);
+        feed.stopWindDown();
+        (,,, lpTimestamp,) = lp.latestRoundData();
+        (,,, yvTimestamp,) = yv.latestRoundData();
+        assertEq(lpTimestamp, block.timestamp);
+        assertEq(yvTimestamp, block.timestamp);
+        assertFalse(controller.isPriceStale(address(market)));
+        vm.prank(address(market));
+        assertTrue(controller.borrowAllowed(address(this), address(456), 1e18));
     }
 }
-
