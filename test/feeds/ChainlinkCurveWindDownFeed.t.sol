@@ -154,8 +154,8 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         pool = new WindDownMockPool(address(new WindDownMockToken("TOKEN")));
         feed = deploy(0, DURATION);
         WindDownMockDola mockDola = new WindDownMockDola();
-        vm.etch(address(feed.dola()), address(mockDola).code);
-        dola = WindDownMockDola(address(feed.dola()));
+        vm.etch(address(feed.DOLA()), address(mockDola).code);
+        dola = WindDownMockDola(address(feed.DOLA()));
     }
 
     function deploy(uint256 k, uint32 duration) internal returns (ChainlinkCurveWindDownFeed) {
@@ -231,10 +231,10 @@ contract ChainlinkCurveWindDownFeedTest is Test {
 
     function testGenericMetadataAndFixedThreshold() public view {
         assertEq(feed.description(), "TOKEN / USD");
-        assertEq(feed.targetIndex(), 0);
+        assertEq(feed.TARGET_INDEX(), 0);
         assertEq(feed.decimals(), 18);
         assertEq(feed.WIND_DOWN_TRIGGER_EMA(), 1.9e18);
-        assertEq(feed.rwg(), RWG);
+        assertEq(feed.RWG(), RWG);
     }
 
     function testFuzzNormalModeMatchesExistingFeed(uint256 basePrice, uint64 ema) public {
@@ -256,7 +256,7 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         pool.set(0, 2e18, false);
         pool.set(1, 1.5e18, false);
         assertEq(other.description(), "OTHER / USD");
-        assertEq(other.assetOrTargetK(), 1);
+        assertEq(other.ASSET_OR_TARGET_K(), 1);
         assertEq(other.latestAnswer(), int256(uint256(1e36) / 1.5e18));
         assertFalse(other.canStartWindDown());
         pool.set(1, 1.9e18, false);
@@ -363,13 +363,77 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         new ChainlinkCurveWindDownFeed(address(base), address(pool), 0, DURATION, address(0));
     }
 
-    function testInvalidLivePricesRevertAndCannotActivate() public {
+    function testInvalidLivePricesReturnZeroAndCannotActivateOrClaimReward() public {
         pool.set(0, 1.9e18, false);
-        int256[5] memory invalidPrices =
-            [int256(-1), type(int256).min, int256(0), int256(1), type(int256).max / 1e18 + 1];
+        dola.mint(address(feed), 10e18);
+        int256[4] memory invalidPrices = [int256(-1e18), int256(-1), int256(0), int256(1)];
         for (uint256 i; i < invalidPrices.length; i++) {
             base.set(invalidPrices[i], block.timestamp, false);
-            assertTrue(feed.canStartWindDown()); // trigger eligibility does not validate the USD price
+            assertTrue(feed.canStartWindDown()); // eligibility only checks the EMA
+            (uint80 roundId, int256 price, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) =
+                feed.latestRoundData();
+            assertEq(roundId, 0);
+            assertEq(price, 0);
+            assertEq(startedAt, 0);
+            assertEq(updatedAt, 0);
+            assertEq(answeredInRound, 0);
+            assertEq(feed.latestAnswer(), 0);
+            for (uint256 attempt; attempt < 2; attempt++) {
+                vm.expectRevert(ChainlinkCurveWindDownFeed.InvalidBasePrice.selector);
+                feed.startWindDown();
+                assertEq(feed.windDownStartPrice(), 0);
+                assertEq(feed.windDownStartedAt(), 0);
+                assertEq(dola.balanceOf(address(feed)), 10e18);
+                assertEq(dola.balanceOf(address(this)), 0);
+                assertEq(dola.transferCalls(), 0);
+            }
+        }
+        base.set(1e18, block.timestamp, false);
+        feed.startWindDown();
+        assertGt(feed.windDownStartPrice(), 0);
+        assertEq(dola.balanceOf(address(this)), 10e18);
+        assertEq(dola.transferCalls(), 1);
+    }
+
+    function testInvalidPricePropagatesThroughLPAndYearnAndOracleRejectsIt() public {
+        WindDownMockBase otherCoin = new WindDownMockBase();
+        CurveLPPessimisticFeed lp = new CurveLPPessimisticFeed(address(pool), address(feed), address(otherCoin), false);
+        CurveLPYearnV2Feed yv = new CurveLPYearnV2Feed(address(new WindDownMockYearn()), address(lp));
+        Oracle oracle = new Oracle(address(this));
+        address directCollateral = address(0xCA11);
+        address vaultCollateral = address(0xCA12);
+        oracle.setFeed(directCollateral, OracleFeed(address(feed)), 18);
+        oracle.setFeed(vaultCollateral, OracleFeed(address(yv)), 18);
+        pool.set(0, 1.9e18, false);
+        int256[3] memory invalidPrices = [int256(-1e18), int256(0), int256(1)];
+        for (uint256 i; i < invalidPrices.length; i++) {
+            base.set(invalidPrices[i], block.timestamp, false);
+            (, int256 lpPrice,, uint256 lpTimestamp,) = lp.latestRoundData();
+            (, int256 yvPrice,, uint256 yvTimestamp,) = yv.latestRoundData();
+            assertEq(lpPrice, 0);
+            assertEq(lpTimestamp, 0);
+            assertEq(yvPrice, 0);
+            assertEq(yvTimestamp, 0);
+            vm.expectRevert(bytes("Invalid feed price"));
+            oracle.getPrice(directCollateral, 8500);
+            vm.expectRevert(bytes("Invalid feed price"));
+            oracle.getPrice(vaultCollateral, 8500);
+            vm.expectRevert(bytes("Invalid feed price"));
+            oracle.viewPrice(vaultCollateral, 8500);
+            assertEq(oracle.dailyLows(directCollateral, block.timestamp / 1 days), 0);
+            assertEq(oracle.dailyLows(vaultCollateral, block.timestamp / 1 days), 0);
+        }
+        base.set(1e18, block.timestamp, false);
+        assertEq(oracle.getFeedPrice(directCollateral), uint256(feed.latestAnswer()));
+        assertGt(oracle.getPrice(vaultCollateral, 8500), 0);
+        assertEq(feed.windDownStartPrice(), 0);
+    }
+
+    function testArithmeticFailuresStillRevert() public {
+        pool.set(0, 1.9e18, false);
+        int256[2] memory overflowingPrices = [type(int256).min, type(int256).max / 1e18 + 1];
+        for (uint256 i; i < overflowingPrices.length; i++) {
+            base.set(overflowingPrices[i], block.timestamp, false);
             vm.expectRevert();
             feed.latestRoundData();
             vm.expectRevert();
