@@ -120,6 +120,11 @@ contract ChainlinkCurveWindDownFeed {
         int256 assetToUsdPrice;
         (roundId, assetToUsdPrice, startedAt, updatedAt, answeredInRound) = ASSET_TO_USD.latestRoundData();
         usdPrice = (assetToUsdPrice * int256(10 ** decimals())) / int256(CURVE_POOL.price_oracle(REFERENCE_ORACLE_INDEX));
+        // Accepted precision boundary (V12 F-291933): https://v12.sh/runs/8388/public#finding-291933
+        // For 0 < EMA <= 2e18, a positive base USD input can round to zero only at 1 raw unit
+        // ($1e-18), with EMA > 1e18. This intentionally remains invalid instead of clamping to 1:
+        // FiRM rejects price-dependent operations, including liquidations, and startWindDown()
+        // rejects activation even if canStartWindDown() is true. Active decay is unaffected.
         if (usdPrice <= 0) return (0, 0, 0, 0, 0);
         return (roundId, usdPrice, startedAt, updatedAt, answeredInRound);
     }
