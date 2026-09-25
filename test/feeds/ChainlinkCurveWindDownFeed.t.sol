@@ -256,7 +256,7 @@ contract ChainlinkCurveWindDownFeedTest is Test {
         pool.set(0, 2e18, false);
         pool.set(1, 1.5e18, false);
         assertEq(other.description(), "OTHER / USD");
-        assertEq(other.ASSET_OR_TARGET_K(), 1);
+        assertEq(other.REFERENCE_ORACLE_INDEX(), 1);
         assertEq(other.latestAnswer(), int256(uint256(1e36) / 1.5e18));
         assertFalse(other.canStartWindDown());
         pool.set(1, 1.9e18, false);

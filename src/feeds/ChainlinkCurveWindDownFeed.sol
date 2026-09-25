@@ -25,7 +25,7 @@ contract ChainlinkCurveWindDownFeed {
 
     IChainlinkBasePriceFeed public immutable ASSET_TO_USD;
     ICurvePool public immutable CURVE_POOL;
-    uint256 public immutable ASSET_OR_TARGET_K;
+    uint256 public immutable REFERENCE_ORACLE_INDEX;
     uint32 public immutable WIND_DOWN_DURATION;
     address public immutable RWG;
     string public description;
@@ -59,7 +59,7 @@ contract ChainlinkCurveWindDownFeed {
         ASSET_TO_USD = IChainlinkBasePriceFeed(_assetToUsd);
         if (ASSET_TO_USD.decimals() != 18 || _duration == 0 || _rwg == address(0)) revert InvalidConfiguration();
         CURVE_POOL = ICurvePool(_curvePool);
-        ASSET_OR_TARGET_K = _k;
+        REFERENCE_ORACLE_INDEX = _k;
         WIND_DOWN_DURATION = _duration;
         RWG = _rwg;
         // Check that the selected oracle index is populated and infer the target description.
@@ -71,7 +71,7 @@ contract ChainlinkCurveWindDownFeed {
     /// @notice Whether the EMA permits activation and wind-down has not already started.
     /// @dev Only checks the trigger. Execution still needs a readable positive USD price and DOLA transfer.
     function canStartWindDown() external view returns (bool) {
-        return windDownStartPrice == 0 && CURVE_POOL.price_oracle(ASSET_OR_TARGET_K) >= WIND_DOWN_TRIGGER_EMA;
+        return windDownStartPrice == 0 && CURVE_POOL.price_oracle(REFERENCE_ORACLE_INDEX) >= WIND_DOWN_TRIGGER_EMA;
     }
 
     /// @notice Activates decay and immediately pays the caller this feed's entire DOLA balance.
@@ -80,7 +80,7 @@ contract ChainlinkCurveWindDownFeed {
     ///      changes would revert too. The keeper should submit this as a separate transaction.
     function startWindDown() external {
         if (windDownStartPrice != 0) revert WindDownAlreadyStarted();
-        uint256 ema = CURVE_POOL.price_oracle(ASSET_OR_TARGET_K);
+        uint256 ema = CURVE_POOL.price_oracle(REFERENCE_ORACLE_INDEX);
         if (ema < WIND_DOWN_TRIGGER_EMA) revert TriggerNotReached();
         (, int256 price,,,) = latestRoundData();
         if (price <= 0) revert InvalidBasePrice();
@@ -119,7 +119,7 @@ contract ChainlinkCurveWindDownFeed {
         }
         int256 assetToUsdPrice;
         (roundId, assetToUsdPrice, startedAt, updatedAt, answeredInRound) = ASSET_TO_USD.latestRoundData();
-        usdPrice = (assetToUsdPrice * int256(10 ** decimals())) / int256(CURVE_POOL.price_oracle(ASSET_OR_TARGET_K));
+        usdPrice = (assetToUsdPrice * int256(10 ** decimals())) / int256(CURVE_POOL.price_oracle(REFERENCE_ORACLE_INDEX));
         if (usdPrice <= 0) return (0, 0, 0, 0, 0);
         return (roundId, usdPrice, startedAt, updatedAt, answeredInRound);
     }
