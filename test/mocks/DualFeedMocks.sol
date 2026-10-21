@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 contract DualFeedSourceMock {
     uint8 public immutable decimals;
-    string public description = "ETH / USD";
+    string public description = "ASSET / QUOTE";
     int256 public answer;
     uint256 public updatedAt;
     uint80 public roundId = 7;
@@ -64,10 +64,15 @@ contract DualFeedSourceMock {
 }
 
 contract RedstoneAdapterMock {
+    uint256 public immutable maxDataStaleness;
     uint256 public dataMilliseconds;
     uint256 public publishedAt;
     uint256 public value;
     bool public failRead;
+
+    constructor(uint256 _maxDataStaleness) {
+        maxDataStaleness = _maxDataStaleness;
+    }
 
     function set(uint256 data_, uint256 published_, uint256 value_) external {
         dataMilliseconds = data_;
@@ -86,7 +91,7 @@ contract RedstoneAdapterMock {
 
     function getLastUpdateDetails(bytes32) external view returns (uint256, uint256, uint256) {
         require(!failRead, "Adapter failed");
-        require(value > 0 && publishedAt + 30 hours > block.timestamp, "Redstone expired");
+        require(value > 0 && publishedAt + maxDataStaleness > block.timestamp, "Redstone expired");
         return (dataMilliseconds, publishedAt, value);
     }
 }
@@ -100,7 +105,7 @@ contract ExpiringRedstoneFeedMock {
     }
 
     function latestRoundData() external view returns (uint80, int256, uint256, uint256, uint80) {
-        (, uint256 timestamp, uint256 value) = adapter.getLastUpdateDetails(bytes32("ETH"));
+        (, uint256 timestamp, uint256 value) = adapter.getLastUpdateDetails(bytes32("ASSET"));
         return (1, int256(value), timestamp, timestamp, 1);
     }
 }
@@ -123,8 +128,8 @@ contract DualFeedCurvePoolMock {
     }
 }
 
-contract DualFeedInvTokenMock {
+contract DualFeedTokenMock {
     function symbol() external pure returns (string memory) {
-        return "INV";
+        return "ASSET";
     }
 }

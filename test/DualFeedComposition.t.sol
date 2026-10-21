@@ -10,7 +10,7 @@ import {
     DualFeedSourceMock,
     RedstoneAdapterMock,
     DualFeedCurvePoolMock,
-    DualFeedInvTokenMock
+    DualFeedTokenMock
 } from "test/mocks/DualFeedMocks.sol";
 
 contract DualFeedCompositionTest is Test {
@@ -22,26 +22,27 @@ contract DualFeedCompositionTest is Test {
         vm.warp(1000 days);
         primary = new DualFeedSourceMock(8);
         primary.setRound(2000e8, block.timestamp);
-        adapter = new RedstoneAdapterMock();
+        adapter = new RedstoneAdapterMock(30 hours);
         adapter.set(block.timestamp * 1000, block.timestamp, 1900e8);
-        RedstoneStoredPriceFeed stored = new RedstoneStoredPriceFeed(address(adapter), bytes32("ETH"), "ETH / USD");
+        RedstoneStoredPriceFeed stored =
+            new RedstoneStoredPriceFeed(address(adapter), bytes32("ASSET"), 8, 1 minutes, "ASSET / QUOTE");
         usd = new DualFeedPriceFeed(address(this), address(primary), address(stored), 3660);
     }
 
-    function test_invCompositionPreservesCurveFeeAndSelectedAgeAfterExpiry() public {
-        DualFeedInvTokenMock inv = new DualFeedInvTokenMock();
-        DualFeedCurvePoolMock pool = new DualFeedCurvePoolMock(address(inv));
-        DynamicFeeCurveFeed feed = new DynamicFeeCurveFeed(address(usd), address(pool), address(inv), address(this));
+    function test_curveCompositionPreservesCurveFeeAndSelectedAgeAfterExpiry() public {
+        DualFeedTokenMock asset = new DualFeedTokenMock();
+        DualFeedCurvePoolMock pool = new DualFeedCurvePoolMock(address(asset));
+        DynamicFeeCurveFeed feed = new DynamicFeeCurveFeed(address(usd), address(pool), address(asset), address(this));
         (, int256 price,, uint256 timestamp,) = feed.latestRoundData();
-        assertEq(price, 9.8e18); // 2000 USD/ETH * 0.005 ETH/INV * 98%
+        assertEq(price, 9.8e18); // 2000 QUOTE/BRIDGE * 0.005 BRIDGE/ASSET * 98%
         assertEq(timestamp, block.timestamp);
 
         vm.warp(block.timestamp + 1 minutes);
         adapter.set(block.timestamp * 1000, block.timestamp, 1900e8);
         uint256 fallbackTimestamp = block.timestamp;
-        vm.warp(block.timestamp + 30 hours);
+        vm.warp(block.timestamp + adapter.maxDataStaleness());
         vm.expectRevert("Redstone expired");
-        adapter.getLastUpdateDetails(bytes32("ETH"));
+        adapter.getLastUpdateDetails(bytes32("ASSET"));
         (, price,, timestamp,) = feed.latestRoundData();
         assertEq(price, 9.31e18);
         assertEq(timestamp, fallbackTimestamp);
@@ -49,7 +50,7 @@ contract DualFeedCompositionTest is Test {
         assertEq(feed.maxFee(), 2e8);
     }
 
-    function test_wbtcCompositionRetainsOlderConversionLegTimestamp() public {
+    function test_bridgeCompositionRetainsOlderConversionLegTimestamp() public {
         primary.setRound(50000e8, block.timestamp);
         DualFeedSourceMock ratio = new DualFeedSourceMock(18);
         ratio.setRound(0.999e18, block.timestamp - 2 hours);

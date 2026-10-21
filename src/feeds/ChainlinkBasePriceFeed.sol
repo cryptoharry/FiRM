@@ -63,6 +63,7 @@ contract ChainlinkBasePriceFeed {
     function latestRoundData()
         public
         view
+        virtual
         returns (
             uint80 roundId,
             int256 usdPrice,
@@ -131,7 +132,7 @@ contract ChainlinkBasePriceFeed {
         return address(assetToUsdFallback) != address(0);
     }
 
-    function setHeartbeat(uint256 newHeartbeat) public onlyOwner {
+    function setHeartbeat(uint256 newHeartbeat) public virtual onlyOwner {
         assetToUsdHeartbeat = newHeartbeat;
     }
 

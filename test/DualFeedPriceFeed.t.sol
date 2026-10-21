@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
 import {DualFeedPriceFeed} from "src/feeds/DualFeedPriceFeed.sol";
+import {ChainlinkBasePriceFeed} from "src/feeds/ChainlinkBasePriceFeed.sol";
 import {DualFeedSourceMock} from "test/mocks/DualFeedMocks.sol";
 
 contract DualFeedPriceFeedTest is Test {
@@ -148,6 +149,27 @@ contract DualFeedPriceFeedTest is Test {
     function test_malformedBoundsDoNotDisableFallback() public {
         vm.mockCall(address(primary), abi.encodeWithSignature("minAnswer()"), hex"01");
         _assertQuote(1900e18, block.timestamp, 9);
+    }
+
+    function test_malformedSignedBoundDoesNotDisableFallback() public {
+        vm.mockCall(address(primary), abi.encodeWithSignature("minAnswer()"), abi.encode(uint256(1) << 191));
+        _assertQuote(1900e18, block.timestamp, 9);
+    }
+
+    function test_singleSourceRetainsAgeWithoutChangingLegacyBase() public {
+        DualFeedPriceFeed single = new DualFeedPriceFeed(address(this), address(primary), address(0), HEARTBEAT);
+        ChainlinkBasePriceFeed legacy =
+            new ChainlinkBasePriceFeed(address(this), address(primary), address(0), HEARTBEAT);
+        primary.setRound(2000e8, block.timestamp - 40 hours);
+        (, int256 answer,, uint256 timestamp,) = single.latestRoundData();
+        assertEq(answer, 2000e18);
+        assertEq(timestamp, block.timestamp - 40 hours);
+        assertFalse(single.hasFallback());
+        (,,, uint256 legacyTimestamp,) = legacy.latestRoundData();
+        assertEq(legacyTimestamp, 0);
+        primary.setFailRead(true);
+        vm.expectRevert(DualFeedPriceFeed.NoValidPrice.selector);
+        single.latestRoundData();
     }
 
     function test_overflowingFallbackQuoteDoesNotDisablePrimary() public {

@@ -23,8 +23,9 @@ contract DualFeedMarketTest is FiRMBaseTest {
             callOnDepositCallback
         );
         primary = new DualFeedSourceMock(8);
-        adapter = new RedstoneAdapterMock();
-        RedstoneStoredPriceFeed stored = new RedstoneStoredPriceFeed(address(adapter), bytes32("ETH"), "ETH / USD");
+        adapter = new RedstoneAdapterMock(30 hours);
+        RedstoneStoredPriceFeed stored =
+            new RedstoneStoredPriceFeed(address(adapter), bytes32("ASSET"), 8, 1 minutes, "ASSET / QUOTE");
         dual = new DualFeedPriceFeed(gov, address(primary), address(stored), 3660);
         ExpiringRedstoneFeedMock expiring = new ExpiringRedstoneFeedMock(adapter);
         legacy = new ChainlinkBasePriceFeed(gov, address(primary), address(expiring), 3660);
@@ -111,6 +112,6 @@ contract DualFeedMarketTest is FiRMBaseTest {
         vm.warp(block.timestamp + 4 minutes);
         fallbackTimestamp = block.timestamp;
         adapter.set(block.timestamp * 1000, block.timestamp, 900e8);
-        vm.warp(block.timestamp + 30 hours);
+        vm.warp(block.timestamp + adapter.maxDataStaleness());
     }
 }
